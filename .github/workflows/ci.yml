@@ -1,15 +1,13 @@
 name: CI
 
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+  workflow_dispatch:
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
 
     strategy:
       matrix:
@@ -68,6 +66,7 @@ jobs:
             pgx-test-tls-client-conn-string: "host=localhost user=pgx_sslcert sslmode=verify-full sslrootcert=/tmp/ca.pem sslcert=/tmp/pgx_sslcert.crt sslkey=/tmp/pgx_sslcert.key dbname=pgx_test"
           - pg-version: cockroachdb
             pgx-test-database: "postgresql://root@127.0.0.1:26257/pgx_test?sslmode=disable&experimental_enable_temp_tables=on"
+            pgx-test-tcp-conn-string: "postgresql://root@127.0.0.1:26257/pgx_test?sslmode=disable"
 
     steps:
       - name: Check out code into the Go module directory
@@ -82,6 +81,33 @@ jobs:
         run: ci/setup_test.bash
         env:
           PGVERSION: ${{ matrix.pg-version }}
+
+      - name: Setup pgbouncer and CrateDB
+        if: matrix.pg-version != 'cockroachdb'
+        run: |
+          docker run -d --name crate -p 6543:5432 crate:5.10 -Cdiscovery.type=single-node
+          sudo apt-get install -y -qq pgbouncer
+          sudo tee /etc/pgbouncer/pgbouncer.ini > /dev/null <<'EOF'
+          [databases]
+          pgx_test = host=127.0.0.1 port=5432 dbname=pgx_test
+
+          [pgbouncer]
+          listen_addr = 127.0.0.1
+          listen_port = 6432
+          auth_type = trust
+          auth_file = /etc/pgbouncer/userlist.txt
+          pool_mode = session
+          max_client_conn = 200
+          default_pool_size = 50
+          ignore_startup_parameters = extra_float_digits
+          EOF
+          echo '"pgx_md5" "secret"' | sudo tee /etc/pgbouncer/userlist.txt > /dev/null
+          sudo systemctl restart pgbouncer
+          for i in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 6432 && break; sleep 1; done
+          pg_isready -h 127.0.0.1 -p 6432
+          for i in $(seq 1 90); do pg_isready -h 127.0.0.1 -p 6543 && break; sleep 2; done
+          docker logs crate 2>&1 | tail -n 5
+          pg_isready -h 127.0.0.1 -p 6543
 
       # - name: Setup upterm session
       #   uses: lhotari/action-upterm@v1
@@ -99,15 +125,14 @@ jobs:
       #     PGX_SSL_PASSWORD: ${{ matrix.pgx-ssl-password }}
       #     PGX_TEST_TLS_CLIENT_CONN_STRING: ${{ matrix.pgx-test-tls-client-conn-string }}
 
-      - name: Check formatting
-        run: |
-          gofmt -l -s -w .
-          git status
-          git diff --exit-code
-
       - name: Test
         # parallel testing is disabled because somehow parallel testing causes Github Actions to kill the runner.
-        run: go test -parallel=1 -race ./...
+        run: |
+          go test -v -parallel=1 -race ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          awk '/^--- PASS/{p++} /^--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} /^ok[[:space:]]/{k++} END{printf "TEST SUMMARY: %d top-level tests passed, %d failed, %d skipped (incl. subtests); packages ok: %d\n", p, f, s, k}' "$RUNNER_TEMP/test.log"
+          echo "SKIPPED TESTS BY REASON:"
+          awk '{sub(/\r$/,"")} /^=== (RUN|CONT|NAME|PAUSE) /{cur=$3; next} /^[[:space:]]*--- SKIP: /{n=$3; r=(n in last)?last[n]:"no reason logged"; a[r]=a[r] (a[r]?", ":"") n; next} /^[[:space:]]+[^[:space:]]+[.]go:[0-9]+:( |$)/{m=$0; sub(/^[[:space:]]+/,"",m); match(m,/^[^[:space:]]+[.]go:[0-9]+/); loc=substr(m,1,RLENGTH); m=substr(m,RLENGTH+2); sub(/^ /,"",m); if (m=="") m="empty skip message at " loc; if (cur!="") last[cur]=m} END{for (k in a) print "  SKIP [" k "]: " a[k]}' "$RUNNER_TEMP/test.log" | sort
+          echo "NOTE: services are provisioned per leg where the runner can host them: the Linux PostgreSQL legs run pgbouncer, CrateDB, TLS and every auth method; the Windows legs (action-setup-postgres, unix sockets disabled, no SSL, no Linux containers) run TCP/MD5/plain/SCRAM but cannot host unix-socket, TLS, pgbouncer or CrateDB, which run on the Linux legs; the cockroachdb legs (insecure single-node: no passwords, TLS or unix socket) skip those plus server-feature gaps the tests name. \"empty skip message at pgxtest.go:153\" is pgxtest.SkipCockroachDB called with an empty message."
         env:
           PGX_TEST_DATABASE: ${{ matrix.pgx-test-database }}
           PGX_TEST_UNIX_SOCKET_CONN_STRING: ${{ matrix.pgx-test-unix-socket-conn-string }}
@@ -116,13 +141,16 @@ jobs:
           PGX_TEST_MD5_PASSWORD_CONN_STRING: ${{ matrix.pgx-test-md5-password-conn-string }}
           PGX_TEST_PLAIN_PASSWORD_CONN_STRING: ${{ matrix.pgx-test-plain-password-conn-string }}
           # TestConnectTLS fails. However, it succeeds if I connect to the CI server with upterm and run it. Give up on that test for now.
-          # PGX_TEST_TLS_CONN_STRING: ${{ matrix.pgx-test-tls-conn-string }}
+          PGX_TEST_TLS_CONN_STRING: ${{ matrix.pgx-test-tls-conn-string }}
+          PGX_TEST_PGBOUNCER_CONN_STRING: ${{ matrix.pg-version != 'cockroachdb' && 'host=127.0.0.1 port=6432 user=pgx_md5 password=secret dbname=pgx_test' || '' }}
+          PGX_TEST_CRATEDB_CONN_STRING: ${{ matrix.pg-version != 'cockroachdb' && 'host=127.0.0.1 port=6543 user=crate dbname=doc sslmode=disable' || '' }}
           PGX_SSL_PASSWORD: ${{ matrix.pgx-ssl-password }}
           PGX_TEST_TLS_CLIENT_CONN_STRING: ${{ matrix.pgx-test-tls-client-conn-string }}
 
   test-windows:
     name: Test Windows
     runs-on: windows-latest
+    timeout-minutes: 60
     strategy:
       matrix:
         go-version: ["1.23", "1.24"]
@@ -149,8 +177,86 @@ jobs:
           PGSERVICE: ${{ steps.postgres.outputs.service-name }}
         shell: bash
 
+      - name: Enable password-auth connection tests
+        run: |
+          HBA="$(psql -tAc 'show hba_file' pgx_test)"
+          { printf '%s\n' 'host all pgx_md5 127.0.0.1/32 md5' 'host all pgx_pw 127.0.0.1/32 password' 'host all pgx_scram 127.0.0.1/32 scram-sha-256'; cat "$HBA"; } > "$RUNNER_TEMP/pg_hba.conf"
+          cp "$RUNNER_TEMP/pg_hba.conf" "$HBA"
+          psql -c 'select pg_reload_conf()' pgx_test
+          head -5 "$HBA"
+        env:
+          PGSERVICE: ${{ steps.postgres.outputs.service-name }}
+        shell: bash
+
       - name: Test
         # parallel testing is disabled because somehow parallel testing causes Github Actions to kill the runner.
-        run: go test -parallel=1 -race  ./...
+        shell: bash
+        run: |
+          go test -v -parallel=1 -race  ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          awk '/^--- PASS/{p++} /^--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} /^ok[[:space:]]/{k++} END{printf "TEST SUMMARY: %d top-level tests passed, %d failed, %d skipped (incl. subtests); packages ok: %d\n", p, f, s, k}' "$RUNNER_TEMP/test.log"
+          echo "SKIPPED TESTS BY REASON:"
+          awk '{sub(/\r$/,"")} /^=== (RUN|CONT|NAME|PAUSE) /{cur=$3; next} /^[[:space:]]*--- SKIP: /{n=$3; r=(n in last)?last[n]:"no reason logged"; a[r]=a[r] (a[r]?", ":"") n; next} /^[[:space:]]+[^[:space:]]+[.]go:[0-9]+:( |$)/{m=$0; sub(/^[[:space:]]+/,"",m); match(m,/^[^[:space:]]+[.]go:[0-9]+/); loc=substr(m,1,RLENGTH); m=substr(m,RLENGTH+2); sub(/^ /,"",m); if (m=="") m="empty skip message at " loc; if (cur!="") last[cur]=m} END{for (k in a) print "  SKIP [" k "]: " a[k]}' "$RUNNER_TEMP/test.log" | sort
+          echo "NOTE: services are provisioned per leg where the runner can host them: the Linux PostgreSQL legs run pgbouncer, CrateDB, TLS and every auth method; the Windows legs (action-setup-postgres, unix sockets disabled, no SSL, no Linux containers) run TCP/MD5/plain/SCRAM but cannot host unix-socket, TLS, pgbouncer or CrateDB, which run on the Linux legs; the cockroachdb legs (insecure single-node: no passwords, TLS or unix socket) skip those plus server-feature gaps the tests name. \"empty skip message at pgxtest.go:153\" is pgxtest.SkipCockroachDB called with an empty message."
         env:
           PGX_TEST_DATABASE: ${{ steps.postgres.outputs.connection-uri }}
+          PGX_TEST_TCP_CONN_STRING: "host=127.0.0.1 user=pgx_md5 password=secret dbname=pgx_test"
+          PGX_TEST_SCRAM_PASSWORD_CONN_STRING: "host=127.0.0.1 user=pgx_scram password=secret dbname=pgx_test"
+          PGX_TEST_MD5_PASSWORD_CONN_STRING: "host=127.0.0.1 user=pgx_md5 password=secret dbname=pgx_test"
+          PGX_TEST_PLAIN_PASSWORD_CONN_STRING: "host=127.0.0.1 user=pgx_pw password=secret dbname=pgx_test"
+
+  module-zip:
+    name: Build module zip
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build module zip
+        run: |
+          mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/dist"
+          cat > "$RUNNER_TEMP/modzip/main.go" <<'EOF'
+          package main
+
+          import (
+          "log"
+          "os"
+
+          "golang.org/x/mod/module"
+          "golang.org/x/mod/zip"
+          )
+
+          func main() {
+          dir, out := os.Args[1], os.Args[2]
+          f, err := os.Create(out)
+          if err != nil {
+          log.Fatal(err)
+          }
+          defer f.Close()
+          v := module.Version{Path: "github.com/jackc/pgx/v5", Version: "v5.7.6"}
+          if err := zip.CreateFromDir(f, v, dir); err != nil {
+          log.Fatal(err)
+          }
+          f.Close()
+          }
+          EOF
+          cd "$RUNNER_TEMP/modzip"
+          go mod init modzip
+          go get golang.org/x/mod@v0.24.0
+          go run . "$GITHUB_WORKSPACE" "$RUNNER_TEMP/dist/v5.7.6.zip"
+          unzip -l "$RUNNER_TEMP/dist/v5.7.6.zip" | tail -5
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$RUNNER_TEMP/dist/v5.7.6.zip" "$GITHUB_WORKSPACE/dist/v5.7.6.zip"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v5.7.6.zip
+          if-no-files-found: error

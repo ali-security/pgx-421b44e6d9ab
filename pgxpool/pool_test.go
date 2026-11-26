@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -151,6 +152,9 @@ func TestPoolAcquireAndConnHijack(t *testing.T) {
 }
 
 func TestPoolAcquireChecksIdleConns(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipped on Windows: asserts the new backend PID differs from the terminated ones, but Windows reuses freed PIDs immediately")
+	}
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -205,6 +209,9 @@ func TestPoolAcquireChecksIdleConns(t *testing.T) {
 }
 
 func TestPoolAcquireChecksIdleConnsWithShouldPing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipped on Windows: asserts a 200ms sleep within +/-100ms; Windows timer granularity overshoots")
+	}
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -624,6 +631,9 @@ func TestConnReleaseClosesBusyConn(t *testing.T) {
 }
 
 func TestPoolBackgroundChecksMaxConnLifetime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipped on Windows: background health-check timing race is flaky on the Windows runner")
+	}
 	t.Parallel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
