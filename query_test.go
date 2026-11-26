@@ -2167,6 +2167,30 @@ func TestQueryWithQueryRewriter(t *testing.T) {
 	})
 }
 
+func TestConnQuerySanitizeSQLWithDollarQuotesStrings(t *testing.T) {
+	t.Parallel()
+	skipCockroachDB(t, "CockroachDB auto commits DDL by default")
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	ctx := context.Background()
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `create table canary(id text primary key)`)
+	require.NoError(t, err)
+
+	attackValue := `$tag$; drop table canary; --`
+	_, err = tx.Exec(ctx, `select $tag$ $1 $tag$, $1`, pgx.QueryExecModeSimpleProtocol, attackValue)
+	require.NoError(t, err)
+
+	_, err = tx.Exec(ctx, `select * from canary`)
+	require.NoError(t, err)
+}
+
 // This example uses Query without using any helpers to read the results. Normally CollectRows, ForEachRow, or another
 // helper function should be used.
 func ExampleConn_Query() {
